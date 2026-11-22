@@ -1,3 +1,4 @@
+
 <?php
 
 header("Content-Type: application/json; charset=UTF-8");
@@ -12,47 +13,83 @@ if ($_SERVER["REQUEST_METHOD"] === "OPTIONS") {
 
 if ($_SERVER["REQUEST_METHOD"] !== "POST") {
     http_response_code(405);
+
     echo json_encode([
         "success" => false,
         "reply" => "POST requests only."
     ]);
+
     exit;
 }
 
-function sendResponse($success, $reply, $extra = [])
+// =========================================
+// JSON RESPONSE
+// =========================================
+
+function sendResponse($success, $reply, $extra = [], $status = 200)
 {
-    echo json_encode(array_merge([
-        "success" => $success,
-        "reply" => $reply
-    ], $extra));
+    http_response_code($status);
+
+    echo json_encode(
+        array_merge([
+            "success" => $success,
+            "reply" => $reply
+        ], $extra),
+        JSON_UNESCAPED_UNICODE
+    );
+
     exit;
 }
 
-$input = json_decode(file_get_contents("php://input"), true);
+// =========================================
+// RECEIVE REQUEST
+// =========================================
+
+$input = json_decode(
+    file_get_contents("php://input"),
+    true
+);
+
+if (!is_array($input)) {
+    sendResponse(false, "Invalid JSON request.", [], 400);
+}
 
 $message = trim($input["message"] ?? "");
 $context = trim($input["context"] ?? "");
 
 if ($message === "") {
-    http_response_code(400);
-    sendResponse(false, "Please enter a message.");
+    sendResponse(false, "Please enter a message.", [], 400);
 }
 
 if (strlen($message) > 2000) {
-    http_response_code(400);
-    sendResponse(false, "Your message is too long.");
+    sendResponse(false, "Your message is too long.", [], 400);
 }
+
+// =========================================
+// GEMINI CONFIGURATION
+// =========================================
 
 $apiKey = getenv("GEMINI_API_KEY");
 
 if (!$apiKey) {
-    http_response_code(500);
-    sendResponse(false, "AI service is not configured.");
+    sendResponse(
+        false,
+        "AI service is not configured. Please check the server configuration.",
+        [],
+        500
+    );
 }
+
+// Updated Gemini model
+$model = "gemini-3.1-flash-lite";
 
 if ($context === "") {
     $context = "TouEARIST is a campus information and virtual-tour project designed to help users explore EARIST Cavite Campus. It is separate from the official EARIST website.";
 }
+
+// =========================================
+// SYSTEM PROMPT
+// =========================================
 
 $systemPrompt = "
 You are the TouEARIST AI Assistant.
@@ -71,72 +108,215 @@ Keep answers clear, friendly, and concise.
 VERIFIED INFORMATION:
 " . $context;
 
+// =========================================
+// GEMINI REQUEST PAYLOAD
+// =========================================
+
 $payload = [
     "systemInstruction" => [
         "parts" => [
-            ["text" => $systemPrompt]
+            [
+                "text" => $systemPrompt
+            ]
         ]
     ],
+
     "contents" => [
         [
             "role" => "user",
             "parts" => [
-                ["text" => $message]
+                [
+                    "text" => $message
+                ]
             ]
         ]
     ],
+
     "generationConfig" => [
         "temperature" => 0.2,
         "maxOutputTokens" => 500
     ]
 ];
 
-$ch = curl_init(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+$jsonPayload = json_encode(
+    $payload,
+    JSON_UNESCAPED_UNICODE
 );
+
+if ($jsonPayload === false) {
+    sendResponse(
+        false,
+        "Unable to prepare the AI request.",
+        [],
+        500
+    );
+}
+
+// =========================================
+// GEMINI API CONNECTION
+// =========================================
+
+$geminiUrl =
+    "https://generativelanguage.googleapis.com/v1beta/models/" .
+    $model .
+    ":generateContent";
+
+$ch = curl_init($geminiUrl);
 
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_POST => true,
+
     CURLOPT_HTTPHEADER => [
         "Content-Type: application/json",
+        "Accept: application/json",
         "x-goog-api-key: " . $apiKey
     ],
-    CURLOPT_POSTFIELDS => json_encode($payload),
-    CURLOPT_TIMEOUT => 60
+
+    CURLOPT_POSTFIELDS => $jsonPayload,
+
+    CURLOPT_CONNECTTIMEOUT => 20,
+    CURLOPT_TIMEOUT => 90
 ]);
 
 $result = curl_exec($ch);
+
 $curlError = curl_error($ch);
-$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+$httpCode = curl_getinfo(
+    $ch,
+    CURLINFO_HTTP_CODE
+);
 
 curl_close($ch);
 
+// =========================================
+// CONNECTION ERROR
+// =========================================
+
 if ($result === false) {
-    http_response_code(502);
-    sendResponse(false, "Unable to connect to the AI service.", [
-        "error" => $curlError
-    ]);
+    error_log("Gemini cURL error: " . $curlError);
+
+    sendResponse(
+        false,
+        "Unable to connect to the Gemini AI service.",
+        [
+            "provider" => "Gemini",
+            "model" => $model,
+            "connection_error" => $curlError
+        ],
+        502
+    );
 }
+
+// =========================================
+// DECODE GEMINI RESPONSE
+// =========================================
 
 $data = json_decode($result, true);
 
-if ($httpCode !== 200) {
-    http_response_code(502);
-    sendResponse(false, "The AI service returned an error.", [
-        "provider_status" => $httpCode
-    ]);
+if (!is_array($data)) {
+    sendResponse(
+        false,
+        "Invalid response received from Gemini.",
+        [
+            "provider" => "Gemini",
+            "model" => $model,
+            "http_status" => $httpCode
+        ],
+        502
+    );
 }
 
-$reply = $data["candidates"][0]["content"]["parts"][0]["text"] ?? "";
+// =========================================
+// GEMINI API ERROR
+// =========================================
+
+if ($httpCode !== 200) {
+
+    $providerMessage =
+        $data["error"]["message"] ??
+        "Unknown Gemini API error.";
+
+    $providerStatus =
+        $data["error"]["status"] ??
+        "UNKNOWN";
+
+    error_log(
+        "Gemini API error: HTTP " .
+        $httpCode .
+        " - " .
+        $providerMessage
+    );
+
+    sendResponse(
+        false,
+        "The Gemini AI service returned an error.",
+        [
+            "provider" => "Gemini",
+            "model" => $model,
+            "provider_status" => $httpCode,
+            "provider_error_status" => $providerStatus,
+            "provider_message" => $providerMessage
+        ],
+        502
+    );
+}
+
+// =========================================
+// EXTRACT AI RESPONSE
+// =========================================
+
+$reply = "";
+
+$candidates = $data["candidates"] ?? [];
+
+if (!empty($candidates)) {
+
+    $parts =
+        $candidates[0]["content"]["parts"] ?? [];
+
+    foreach ($parts as $part) {
+
+        if (!empty($part["text"])) {
+            $reply .= $part["text"];
+        }
+    }
+}
+
+$reply = trim($reply);
+
+// =========================================
+// EMPTY RESPONSE
+// =========================================
 
 if ($reply === "") {
-    http_response_code(502);
-    sendResponse(false, "The AI service returned an empty response.");
+
+    sendResponse(
+        false,
+        "Gemini did not generate a response.",
+        [
+            "provider" => "Gemini",
+            "model" => $model,
+            "finish_reason" =>
+                $candidates[0]["finishReason"] ?? "UNKNOWN"
+        ],
+        502
+    );
 }
 
-sendResponse(true, $reply, [
-    "model" => "gemini-2.5-flash-lite",
-    "provider" => "Gemini",
-    "ai_powered" => true
-]);
+// =========================================
+// SUCCESS
+// =========================================
+
+sendResponse(
+    true,
+    $reply,
+    [
+        "model" => $model,
+        "provider" => "Gemini",
+        "ai_powered" => true
+    ]
+);
+
+?>
