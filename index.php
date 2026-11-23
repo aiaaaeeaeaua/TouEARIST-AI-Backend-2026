@@ -1,4 +1,6 @@
+
 <?php
+
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Origin: https://touearistcavite.infinityfreeapp.com");
 header("Access-Control-Allow-Methods: POST, OPTIONS");
@@ -33,7 +35,7 @@ function sendResponse($success, $reply, $extra = [], $status = 200)
             "success" => $success,
             "reply" => $reply
         ], $extra),
-        JSON_UNESCAPED_UNICODE
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
     );
 
     exit;
@@ -78,7 +80,6 @@ if (!$apiKey) {
     );
 }
 
-// Updated Gemini model
 $model = "gemini-3.1-flash-lite";
 
 if ($context === "") {
@@ -151,7 +152,7 @@ if ($jsonPayload === false) {
 }
 
 // =========================================
-// GEMINI API CONNECTION
+// GEMINI API CONNECTION WITH RETRIES
 // =========================================
 
 $geminiUrl =
@@ -159,49 +160,89 @@ $geminiUrl =
     $model .
     ":generateContent";
 
-$ch = curl_init($geminiUrl);
+$maxAttempts = 3;
+$result = false;
+$curlError = "";
+$httpCode = 0;
+$attemptsUsed = 0;
 
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_POST => true,
+for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
 
-    CURLOPT_HTTPHEADER => [
-        "Content-Type: application/json",
-        "Accept: application/json",
-        "x-goog-api-key: " . $apiKey
-    ],
+    $attemptsUsed = $attempt;
 
-    CURLOPT_POSTFIELDS => $jsonPayload,
+    $ch = curl_init($geminiUrl);
 
-    CURLOPT_CONNECTTIMEOUT => 20,
-    CURLOPT_TIMEOUT => 90
-]);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
 
-$result = curl_exec($ch);
+        CURLOPT_HTTPHEADER => [
+            "Content-Type: application/json",
+            "Accept: application/json",
+            "x-goog-api-key: " . $apiKey
+        ],
 
-$curlError = curl_error($ch);
+        CURLOPT_POSTFIELDS => $jsonPayload,
 
-$httpCode = curl_getinfo(
-    $ch,
-    CURLINFO_HTTP_CODE
-);
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 45
+    ]);
 
-curl_close($ch);
+    $result = curl_exec($ch);
+
+    $curlError = curl_error($ch);
+
+    $httpCode = curl_getinfo(
+        $ch,
+        CURLINFO_HTTP_CODE
+    );
+
+    curl_close($ch);
+
+    // Stop if the request succeeded.
+    if (
+        $result !== false &&
+        $httpCode >= 200 &&
+        $httpCode < 300
+    ) {
+        break;
+    }
+
+    // Retry only temporary provider errors.
+    $temporaryErrors = [
+        429,
+        500,
+        502,
+        503,
+        504
+    ];
+
+    if (
+        $attempt >= $maxAttempts ||
+        !in_array($httpCode, $temporaryErrors, true)
+    ) {
+        break;
+    }
+
+    // Wait before the next attempt.
+    sleep($attempt);
+}
 
 // =========================================
 // CONNECTION ERROR
 // =========================================
 
 if ($result === false) {
+
     error_log("Gemini cURL error: " . $curlError);
 
     sendResponse(
         false,
-        "Unable to connect to the Gemini AI service.",
+        "Unable to connect to the Gemini AI service. Please try again.",
         [
             "provider" => "Gemini",
             "model" => $model,
-            "connection_error" => $curlError
+            "attempts" => $attemptsUsed
         ],
         502
     );
@@ -214,13 +255,15 @@ if ($result === false) {
 $data = json_decode($result, true);
 
 if (!is_array($data)) {
+
     sendResponse(
         false,
         "Invalid response received from Gemini.",
         [
             "provider" => "Gemini",
             "model" => $model,
-            "http_status" => $httpCode
+            "http_status" => $httpCode,
+            "attempts" => $attemptsUsed
         ],
         502
     );
@@ -230,7 +273,7 @@ if (!is_array($data)) {
 // GEMINI API ERROR
 // =========================================
 
-if ($httpCode !== 200) {
+if ($httpCode < 200 || $httpCode >= 300) {
 
     $providerMessage =
         $data["error"]["message"] ??
@@ -249,13 +292,14 @@ if ($httpCode !== 200) {
 
     sendResponse(
         false,
-        "The Gemini AI service returned an error.",
+        "The Gemini AI service is temporarily unavailable. Please try again later.",
         [
             "provider" => "Gemini",
             "model" => $model,
             "provider_status" => $httpCode,
             "provider_error_status" => $providerStatus,
-            "provider_message" => $providerMessage
+            "provider_message" => $providerMessage,
+            "attempts" => $attemptsUsed
         ],
         502
     );
@@ -276,7 +320,7 @@ if (!empty($candidates)) {
 
     foreach ($parts as $part) {
 
-        if (!empty($part["text"])) {
+        if (isset($part["text"])) {
             $reply .= $part["text"];
         }
     }
@@ -297,7 +341,8 @@ if ($reply === "") {
             "provider" => "Gemini",
             "model" => $model,
             "finish_reason" =>
-                $candidates[0]["finishReason"] ?? "UNKNOWN"
+                $candidates[0]["finishReason"] ?? "UNKNOWN",
+            "attempts" => $attemptsUsed
         ],
         502
     );
@@ -313,7 +358,8 @@ sendResponse(
     [
         "model" => $model,
         "provider" => "Gemini",
-        "ai_powered" => true
+        "ai_powered" => true,
+        "attempts" => $attemptsUsed
     ]
 );
 
