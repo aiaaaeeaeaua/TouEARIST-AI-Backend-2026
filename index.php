@@ -1,9 +1,14 @@
+
 <?php
 
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Origin: https://touearistcavite.infinityfreeapp.com");
 header("Access-Control-Allow-Methods: POST, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type");
+
+// =========================================
+// HANDLE REQUEST
+// =========================================
 
 if ($_SERVER["REQUEST_METHOD"] === "OPTIONS") {
     http_response_code(204);
@@ -12,12 +17,10 @@ if ($_SERVER["REQUEST_METHOD"] === "OPTIONS") {
 
 if ($_SERVER["REQUEST_METHOD"] !== "POST") {
     http_response_code(405);
-
     echo json_encode([
         "success" => false,
         "reply" => "POST requests only."
     ]);
-
     exit;
 }
 
@@ -44,10 +47,7 @@ function sendResponse($success, $reply, $extra = [], $status = 200)
 // RECEIVE REQUEST
 // =========================================
 
-$input = json_decode(
-    file_get_contents("php://input"),
-    true
-);
+$input = json_decode(file_get_contents("php://input"), true);
 
 if (!is_array($input)) {
     sendResponse(false, "Invalid JSON request.", [], 400);
@@ -79,7 +79,11 @@ if (!$apiKey) {
     );
 }
 
-$model = "gemini-3.8-flash";
+// Primary and fallback models
+$models = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite"
+];
 
 if ($context === "") {
     $context = "TouEARIST is a campus information and virtual-tour project designed to help users explore EARIST Cavite Campus. It is separate from the official EARIST website.";
@@ -107,15 +111,13 @@ VERIFIED INFORMATION:
 " . $context;
 
 // =========================================
-// GEMINI REQUEST PAYLOAD
+// REQUEST PAYLOAD
 // =========================================
 
 $payload = [
     "systemInstruction" => [
         "parts" => [
-            [
-                "text" => $systemPrompt
-            ]
+            ["text" => $systemPrompt]
         ]
     ],
 
@@ -123,9 +125,7 @@ $payload = [
         [
             "role" => "user",
             "parts" => [
-                [
-                    "text" => $message
-                ]
+                ["text" => $message]
             ]
         ]
     ],
@@ -151,154 +151,166 @@ if ($jsonPayload === false) {
 }
 
 // =========================================
-// GEMINI API CONNECTION WITH RETRIES
+// GEMINI RETRY + AUTOMATIC FALLBACK
 // =========================================
 
-$geminiUrl =
-    "https://generativelanguage.googleapis.com/v1beta/models/" .
-    $model .
-    ":generateContent";
+$maxAttemptsPerModel = 2;
 
-$maxAttempts = 3;
-$result = false;
-$curlError = "";
-$httpCode = 0;
-$attemptsUsed = 0;
+$temporaryErrors = [
+    429,
+    500,
+    502,
+    503,
+    504
+];
 
-for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+$totalAttempts = 0;
+$lastStatus = 0;
+$lastError = "";
+$lastProviderStatus = "UNKNOWN";
 
-    $attemptsUsed = $attempt;
+$successfulData = null;
+$successfulModel = null;
 
-    $ch = curl_init($geminiUrl);
+foreach ($models as $model) {
 
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST => true,
+    $geminiUrl =
+        "https://generativelanguage.googleapis.com/v1beta/models/" .
+        $model .
+        ":generateContent";
 
-        CURLOPT_HTTPHEADER => [
-            "Content-Type: application/json",
-            "Accept: application/json",
-            "x-goog-api-key: " . $apiKey
-        ],
+    for ($attempt = 1; $attempt <= $maxAttemptsPerModel; $attempt++) {
 
-        CURLOPT_POSTFIELDS => $jsonPayload,
+        $totalAttempts++;
 
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_TIMEOUT => 45
-    ]);
+        $ch = curl_init($geminiUrl);
 
-    $result = curl_exec($ch);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
 
-    $curlError = curl_error($ch);
+            CURLOPT_HTTPHEADER => [
+                "Content-Type: application/json",
+                "Accept: application/json",
+                "x-goog-api-key: " . $apiKey
+            ],
 
-    $httpCode = curl_getinfo(
-        $ch,
-        CURLINFO_HTTP_CODE
-    );
+            CURLOPT_POSTFIELDS => $jsonPayload,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => 40
+        ]);
 
-    curl_close($ch);
+        $result = curl_exec($ch);
+        $curlError = curl_error($ch);
 
-    // Stop if the request succeeded.
-    if (
-        $result !== false &&
-        $httpCode >= 200 &&
-        $httpCode < 300
-    ) {
-        break;
+        $httpCode = curl_getinfo(
+            $ch,
+            CURLINFO_HTTP_CODE
+        );
+
+        curl_close($ch);
+
+        $lastStatus = $httpCode;
+        $lastError = $curlError;
+
+        if ($result === false) {
+
+            error_log(
+                "Gemini connection error on " .
+                $model . ": " . $curlError
+            );
+
+            break;
+        }
+
+        $data = json_decode($result, true);
+
+        if (!is_array($data)) {
+
+            error_log(
+                "Invalid Gemini response from " . $model
+            );
+
+            break;
+        }
+
+        // SUCCESS
+        if ($httpCode >= 200 && $httpCode < 300) {
+
+            $successfulData = $data;
+            $successfulModel = $model;
+
+            break 2;
+        }
+
+        $lastProviderStatus =
+            $data["error"]["status"] ?? "UNKNOWN";
+
+        $providerMessage =
+            $data["error"]["message"] ??
+            "Unknown Gemini API error.";
+
+        error_log(
+            "Gemini error on " . $model .
+            ": HTTP " . $httpCode .
+            " - " . $providerMessage
+        );
+
+        // Retry temporary errors.
+        if (in_array($httpCode, $temporaryErrors, true)) {
+
+            if ($attempt < $maxAttemptsPerModel) {
+                sleep(1);
+                continue;
+            }
+
+            // Move to the next model.
+            break;
+        }
+
+        // Model unavailable or not found:
+        // try the next configured model.
+        if ($httpCode === 404) {
+            break;
+        }
+
+        // Do not retry invalid requests or API credentials.
+        sendResponse(
+            false,
+            "Gemini rejected the request. Please check the API configuration.",
+            [
+                "provider" => "Gemini",
+                "model" => $model,
+                "provider_status" => $httpCode,
+                "provider_error_status" => $lastProviderStatus,
+                "provider_message" => $providerMessage,
+                "attempts" => $totalAttempts
+            ],
+            502
+        );
     }
 
-    // Retry only temporary provider errors.
-    $temporaryErrors = [
-        429,
-        500,
-        502,
-        503,
-        504
-    ];
-
-    if (
-        $attempt >= $maxAttempts ||
-        !in_array($httpCode, $temporaryErrors, true)
-    ) {
+    if ($successfulData !== null) {
         break;
     }
-
-    // Wait before the next attempt.
-    sleep($attempt);
 }
 
 // =========================================
-// CONNECTION ERROR
+// ALL MODELS FAILED
 // =========================================
 
-if ($result === false) {
-
-    error_log("Gemini cURL error: " . $curlError);
-
-    sendResponse(
-        false,
-        "Unable to connect to the Gemini AI service. Please try again.",
-        [
-            "provider" => "Gemini",
-            "model" => $model,
-            "attempts" => $attemptsUsed
-        ],
-        502
-    );
-}
-
-// =========================================
-// DECODE GEMINI RESPONSE
-// =========================================
-
-$data = json_decode($result, true);
-
-if (!is_array($data)) {
-
-    sendResponse(
-        false,
-        "Invalid response received from Gemini.",
-        [
-            "provider" => "Gemini",
-            "model" => $model,
-            "http_status" => $httpCode,
-            "attempts" => $attemptsUsed
-        ],
-        502
-    );
-}
-
-// =========================================
-// GEMINI API ERROR
-// =========================================
-
-if ($httpCode < 200 || $httpCode >= 300) {
-
-    $providerMessage =
-        $data["error"]["message"] ??
-        "Unknown Gemini API error.";
-
-    $providerStatus =
-        $data["error"]["status"] ??
-        "UNKNOWN";
-
-    error_log(
-        "Gemini API error: HTTP " .
-        $httpCode .
-        " - " .
-        $providerMessage
-    );
+if ($successfulData === null) {
 
     sendResponse(
         false,
         "The Gemini AI service is temporarily unavailable. Please try again later.",
         [
             "provider" => "Gemini",
-            "model" => $model,
-            "provider_status" => $httpCode,
-            "provider_error_status" => $providerStatus,
-            "provider_message" => $providerMessage,
-            "attempts" => $attemptsUsed
+            "models_tried" => $models,
+            "provider_status" => $lastStatus,
+            "provider_error_status" => $lastProviderStatus,
+            "connection_error" => $lastError,
+            "attempts" => $totalAttempts
         ],
         502
     );
@@ -310,12 +322,11 @@ if ($httpCode < 200 || $httpCode >= 300) {
 
 $reply = "";
 
-$candidates = $data["candidates"] ?? [];
+$candidates = $successfulData["candidates"] ?? [];
 
 if (!empty($candidates)) {
 
-    $parts =
-        $candidates[0]["content"]["parts"] ?? [];
+    $parts = $candidates[0]["content"]["parts"] ?? [];
 
     foreach ($parts as $part) {
 
@@ -338,10 +349,10 @@ if ($reply === "") {
         "Gemini did not generate a response.",
         [
             "provider" => "Gemini",
-            "model" => $model,
+            "model" => $successfulModel,
             "finish_reason" =>
                 $candidates[0]["finishReason"] ?? "UNKNOWN",
-            "attempts" => $attemptsUsed
+            "attempts" => $totalAttempts
         ],
         502
     );
@@ -355,11 +366,10 @@ sendResponse(
     true,
     $reply,
     [
-        "model" => $model,
+        "model" => $successfulModel,
         "provider" => "Gemini",
         "ai_powered" => true,
-        "attempts" => $attemptsUsed
+        "attempts" => $totalAttempts
     ]
 );
 
-?>
