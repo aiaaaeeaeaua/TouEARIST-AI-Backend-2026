@@ -79,7 +79,7 @@ if (!$apiKey) {
     );
 }
 
-$model = "gemini-3.1-flash-lite";
+$model = "gemini-3.8-flash";
 
 if ($context === "") {
     $context = "TouEARIST is a campus information and virtual-tour project designed to help users explore EARIST Cavite Campus. It is separate from the official EARIST website.";
